@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"time"
 
 	"go.etcd.io/etcd/auth"
@@ -40,6 +41,14 @@ const (
 	// We should stop accepting new proposals if the gap growing to a certain point.
 	maxGapBetweenApplyAndCommitIndex = 5000
 	traceThreshold                   = 100 * time.Millisecond
+)
+
+var (
+	range_request_count = 0
+	put_request_count = 0
+	delete_range_request_count = 0
+	txn_request_count = 0
+	compact_request_count = 0
 )
 
 type RaftKV interface {
@@ -87,6 +96,8 @@ type Authenticator interface {
 }
 
 func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
+	range_request_count += 1
+
 	trace := traceutil.New("range",
 		s.getLogger(),
 		traceutil.Field{Key: "range_begin", Value: string(r.Key)},
@@ -97,6 +108,11 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
 	var resp *pb.RangeResponse
 	var err error
 	defer func(start time.Time) {
+		if range_request_count % 100 == 0 || range_request_count < 500 {
+			plog.Info(fmt.Sprintf("**** Range: sequence[%v], key: %s, range_end: %s, time_spent (%v), response Header:(%v), kvs: (%v), more: %v, Count: %v \n", 
+				range_request_count, string(r.Key), string(r.RangeEnd), time.Since(start), resp.Header, resp.Kvs, resp.More, resp.Count))
+		}
+
 		warnOfExpensiveReadOnlyRangeRequest(s.getLogger(), start, r, resp, err)
 		if resp != nil {
 			trace.AddField(
@@ -127,8 +143,21 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
 }
 
 func (s *EtcdServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
+	put_request_count += 1
+
 	ctx = context.WithValue(ctx, traceutil.StartTimeKey, time.Now())
-	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{Put: r})
+	
+	var resp proto.Message
+	var err error
+
+	defer func(start time.Time) {
+		if put_request_count % 100 == 0 || put_request_count < 500 {
+			plog.Info(fmt.Sprintf("++++ Put: sequence[%v], key: %s, value_size: %d, time_spent (%v), response Header:(%v) \n", 
+				put_request_count, string(r.Key), len(r.Value), time.Since(start), resp.(*pb.PutResponse).Header))
+		}
+	}(time.Now())
+
+	resp, err = s.raftRequest(ctx, pb.InternalRaftRequest{Put: r})
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +165,19 @@ func (s *EtcdServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse
 }
 
 func (s *EtcdServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
-	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{DeleteRange: r})
+	delete_range_request_count += 1
+
+	var resp proto.Message
+	var err error
+
+	defer func(start time.Time) {
+		if delete_range_request_count % 100 == 0 || delete_range_request_count < 500 {
+			plog.Info(fmt.Sprintf("---- Delete: sequence[%v], key: %s, range_end: %s, time_spent (%v), response Header:(%v) \n", 
+			delete_range_request_count, string(r.Key), string(r.RangeEnd), time.Since(start), resp.(*pb.DeleteRangeResponse).Header))
+		}
+	}(time.Now())
+
+	resp, err = s.raftRequest(ctx, pb.InternalRaftRequest{DeleteRange: r})
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +185,18 @@ func (s *EtcdServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) 
 }
 
 func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
+	txn_request_count += 1
+
+	var resp *pb.TxnResponse
+	var err error
+
+	defer func(start time.Time) {
+		if txn_request_count % 100 == 0 || txn_request_count < 500 {
+			plog.Info(fmt.Sprintf("##### Txn: sequence[%v], Compare: %v, Success: %v, Failure: %v, time_spent (%v), response Header:(%v), succeeded: %v, responses: %v \n", 
+				txn_request_count, r.Compare, r.Success, r.Failure, time.Since(start), resp.Header, resp.Succeeded, resp.Responses))
+		}
+	}(time.Now())	
+
 	if isTxnReadonly(r) {
 		if !isTxnSerializable(r) {
 			err := s.linearizableReadNotify(ctx)
@@ -151,8 +204,6 @@ func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse
 				return nil, err
 			}
 		}
-		var resp *pb.TxnResponse
-		var err error
 		chk := func(ai *auth.AuthInfo) error {
 			return checkTxnAuth(s.authStore, ai, r)
 		}
@@ -168,11 +219,12 @@ func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse
 		return resp, err
 	}
 
-	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{Txn: r})
+	result, err := s.raftRequest(ctx, pb.InternalRaftRequest{Txn: r})
+	resp = result.(*pb.TxnResponse)
 	if err != nil {
 		return nil, err
 	}
-	return resp.(*pb.TxnResponse), nil
+	return result.(*pb.TxnResponse), nil
 }
 
 func isTxnSerializable(r *pb.TxnRequest) bool {
@@ -204,7 +256,16 @@ func isTxnReadonly(r *pb.TxnRequest) bool {
 }
 
 func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
+	compact_request_count += 1
 	startTime := time.Now()
+
+	defer func(start time.Time) {
+		if compact_request_count % 100 == 0 || compact_request_count < 500 {
+			plog.Info(fmt.Sprintf("^^^^ Compact: sequence[%v], request: %v, value_size: %d, time_spent (%v), response\n", 
+			compact_request_count, r, time.Since(start)))
+		}
+	}(time.Now())
+
 	result, err := s.processInternalRaftRequestOnce(ctx, pb.InternalRaftRequest{Compaction: r})
 	trace := traceutil.TODO()
 	if result != nil && result.trace != nil {

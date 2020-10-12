@@ -85,6 +85,7 @@ func startEtcdOrProxyV2() {
 		plog.Infof("Go Version: %s\n", runtime.Version())
 		plog.Infof("Go OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		plog.Infof("setting maximum number of CPUs to %d, total number of available CPUs is %d", runtime.GOMAXPROCS(0), runtime.NumCPU())
+		plog.Infof("~~~~~ input config: %#v \n", cfg)
 	}
 
 	defer func() {
